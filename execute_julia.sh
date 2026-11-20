@@ -4,7 +4,7 @@
 #SBATCH --ntasks=5
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=64G
-#SBATCH --time=20:00:00
+#SBATCH --time=30:00:00
 #SBATCH --output=julia_%j.out
 #SBATCH --error=julia_%j.err
 

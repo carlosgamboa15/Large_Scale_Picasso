@@ -206,6 +206,25 @@ end
     return nothing
 end
 
+@everywhere   function report_oracle(state; extra=Dict{String,Any}())
+        event = Dict{String,Any}(
+            "type" => "SUBPROBLEM",
+            "iteration" => iter,
+            "subproblem" => n,
+            "state" => state,
+            "worker" => myid(),
+            "node" => gethostname(),
+            "start" => start_datetime,
+            "finish" => nothing,
+            "duration_seconds" => round(time() - start, digits=2),
+            "memory_gb" => memory_rss_gb(),
+            "memory_peak_gb" => memory_peak_gb()
+        )
+
+        merge!(event, extra)
+        put!(WORKER_PROGRESS_CHANNEL, event)
+end
+
 function scenarios(Data)
 
     Y_b = Data.Y_b
@@ -428,24 +447,46 @@ end
     return model
 end
 
-@everywhere function create_oracle_problem(Data)
+@everywhere function create_oracle_problem(Data, u, v, w)
 
     Tf = Data.Tf
-    number_of_generators = Data.Ig
     bus_renewable_generation = Data.bus_renewable_generation
     T = collect(1:Tf)
 
-    u = zeros(number_of_generators, Tf)
-    v = zeros(number_of_generators, Tf)
-    w = zeros(number_of_generators, Tf)
-
+    # Construir el despacho económico con la solución
+    # actual del maestro
     m = economic_dispatch_problem(Data, u, v, w)
-    m_oracle = dualize(m; dual_names = DualNames())
-   
-    @variable(m_oracle, ηpos[b in bus_renewable_generation, t in T], Bin)
-    @variable(m_oracle, ηneg[b in bus_renewable_generation, t in T], Bin)
-    @constraint(m_oracle, [b in bus_renewable_generation, t in T], ηpos[b, t] + ηneg[b, t] ≤ 1)
-    @constraint(m_oracle,  positive[b in bus_renewable_generation, t in T], ηpos[b, t] + ηneg[b, t] ≤ 0)
+
+    # Dualizar el problema primal
+    m_oracle = dualize(
+        m;
+        dual_names = DualNames()
+    )
+
+    # Variables binarias de incertidumbre
+    @variable(
+        m_oracle,
+        ηpos[b in bus_renewable_generation, t in T],
+        Bin
+    )
+
+    @variable(
+        m_oracle,
+        ηneg[b in bus_renewable_generation, t in T],
+        Bin
+    )
+
+    @constraint(
+        m_oracle,
+        [b in bus_renewable_generation, t in T],
+        ηpos[b,t] + ηneg[b,t] <= 1
+    )
+
+    @constraint(
+        m_oracle,
+        positive[b in bus_renewable_generation, t in T],
+        ηpos[b,t] + ηneg[b,t] <= 0
+    )
 
     obj = objective_function(m_oracle)
 
@@ -453,80 +494,7 @@ end
 
 end
 
-@everywhere function modify_oracle(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
-
-    Tf = Data.Tf
-    number_of_generators = Data.Ig
-    D = Data.D
-    Pmin = Data.Pmin
-    Pmax = Data.Pmax
-    RD = Data.RD
-    RU = Data.RU
-    p0 = zeros(number_of_generators)
-    u0 = zeros(number_of_generators)
-    bus_renewable_generation = Data.bus_renewable_generation
-    ind_renewable_generation = Data.ind_renewable_generation
-    T = collect(1:Tf)
-    Ig = collect(1:number_of_generators)
-    Tb_renewable = length(bus_renewable_generation)
-
-    y_n = y[n]
-
-    lower = max.(Ξ_y[:,1], -vcat(PredictionStar...))
-    upper = Ξ_y[:,2]
-
-    yproj_aux = clamp.(y_n, lower, upper)
-    Δpos_aux = upper - yproj_aux
-    Δneg_aux = yproj_aux - lower
-
-    yproj = @views [yproj_aux[((b - 1) * Tf + 1):(b * Tf)] for b in 1:Tb_renewable]
-
-    Δpos = @views [Δpos_aux[((b - 1) * Tf + 1):(b * Tf)] for b in 1:Tb_renewable]
-    Δneg = @views [Δneg_aux[((b - 1) * Tf + 1):(b * Tf)] for b in 1:Tb_renewable]
-
-    ex = sum(m_oracle[Symbol("π[$b,$t]")] *( D[b][t] - (PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t])) -Δpos[ind_renewable_generation[b]][t] * m_oracle[Symbol("π[$b,$t]")] * m_oracle[:ηpos][b, t] + Δneg[ind_renewable_generation[b]][t] * m_oracle[Symbol("π[$b,$t]")] * m_oracle[:ηneg][b, t] + m_oracle[Symbol("π_s[$b,$t]")] * ( PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t]) + Δpos[ind_renewable_generation[b]][t] * m_oracle[Symbol("π_s[$b,$t]")] * m_oracle[:ηpos][b, t] - Δneg[ind_renewable_generation[b]][t] * m_oracle[Symbol("π_s[$b,$t]")] * m_oracle[:ηneg][b, t] - λ*Δpos[ind_renewable_generation[b]][t] * m_oracle[:ηpos][b, t] - λ*Δneg[ind_renewable_generation[b]][t] * m_oracle[:ηneg][b, t] for b ∈ bus_renewable_generation, t ∈ T)
-
-    set_objective_function(m_oracle, obj + ex - λ * norm(yproj_aux - y_n, 1))
-
-    for t in T
-
-            for b in bus_renewable_generation
-
-                REG = maximum([PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t], 0.0])
-
-                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηpos][b, t], -Δpos[ind_renewable_generation[b]][t])
-                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηneg][b, t], Δneg[ind_renewable_generation[b]][t])
-                set_normalized_rhs(m_oracle[:positive][b, t], REG)
-
-            end
-
-        for i in Ig
-
-            set_objective_coefficient(m_oracle, m_oracle[Symbol("x1[$i,$t]")], Pmax[i]*round(Int, u[i, t]))
-            set_objective_coefficient(m_oracle, m_oracle[Symbol("x2[$i,$t]")], Pmin[i]*round(Int, u[i, t]))
-
-            if t == 1
-
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x5[$i,$t]")], RU[i]*u0[i] + Pmax[i]*round(Int,v[i, t]) + p0[i])
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x6[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]) - p0[i])                
-
-            else
-
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x3[$i,$t]")], RU[i]*round(Int, u[i, t-1]) + Pmax[i]*round(Int, v[i, t]))
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x4[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]))
-
-            end
-        end
-    end
-
-    M = 1e4
-
-    @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], -M ≤ m_oracle[Symbol("π[$b,$t]")] ≤ M )   
-
-
-end
-
-@everywhere function modify_oracle_linearized(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
+@everywhere function modify_oracle_linearized(Data, m_oracle, obj, y, Ξ_y, n, λ, PredictionStar)
 
     Tf = Data.Tf
     number_of_generators = Data.Ig
@@ -567,42 +535,37 @@ end
     set_objective_function(m_oracle, obj + ex - λ * norm(yproj_aux - y_n, 1))
 
     for t in T
+        for b in bus_renewable_generation
 
-            for b in bus_renewable_generation
+            r = ind_renewable_generation[b]
 
-                REG = maximum([PredictionStar[ind_renewable_generation[b]][t] + yproj[ind_renewable_generation[b]][t], 0.0])
+            REG = PredictionStar[r][t] + yproj[r][t]
 
-                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηpos][b, t], -Δpos[ind_renewable_generation[b]][t])
-                set_normalized_coefficient(m_oracle[:positive][b, t], m_oracle[:ηneg][b, t], Δneg[ind_renewable_generation[b]][t])
-                set_normalized_rhs(m_oracle[:positive][b, t], REG)
+            set_normalized_coefficient(
+                m_oracle[:positive][b,t],
+                m_oracle[:ηpos][b,t],
+                -Δpos[r][t]
+            )
 
-            end
+            set_normalized_coefficient(
+                m_oracle[:positive][b,t],
+                m_oracle[:ηneg][b,t],
+                Δneg[r][t]
+            )
 
-        for i in Ig
-
-            set_objective_coefficient(m_oracle, m_oracle[Symbol("x1[$i,$t]")], Pmax[i]*round(Int, u[i, t]))
-            set_objective_coefficient(m_oracle, m_oracle[Symbol("x2[$i,$t]")], Pmin[i]*round(Int, u[i, t]))
-
-            if t == 1
-
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x5[$i,$t]")], RU[i]*u0[i] + Pmax[i]*round(Int,v[i, t]) + p0[i])
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x6[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]) - p0[i])                
-
-            else
-
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x3[$i,$t]")], RU[i]*round(Int, u[i, t-1]) + Pmax[i]*round(Int, v[i, t]))
-                set_objective_coefficient(m_oracle, m_oracle[Symbol("x4[$i,$t]")], RD[i]*round(Int, u[i, t]) + Pmax[i]*round(Int, w[i, t]))
-
-            end
+            set_normalized_rhs(
+                m_oracle[:positive][b,t],
+                REG
+            )
         end
     end
 
     M = 1e6
     L, U = -M, M
-    L_s, U_s = 0, M
+    L_s, U_s = -M, 0.0
 
     @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], L ≤ m_oracle[Symbol("π[$b,$t]")] ≤ U)
-    @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], L ≤ m_oracle[Symbol("π_s[$b,$t]")] ≤ U)
+    @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], L_s <= m_oracle[Symbol("π_s[$b,$t]")] <= U_s)
 
     @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], ωpos[b, t] ≥ L*m_oracle[:ηpos][b, t])
     @constraint(m_oracle, [b ∈ bus_renewable_generation, t ∈ T], ωpos[b, t] ≤ U*m_oracle[:ηpos][b, t])
@@ -630,25 +593,6 @@ end
 
     start = time()
     start_datetime = string(now())
-
-    function report_oracle(state; extra=Dict{String,Any}())
-        event = Dict{String,Any}(
-            "type" => "SUBPROBLEM",
-            "iteration" => iter,
-            "subproblem" => n,
-            "state" => state,
-            "worker" => myid(),
-            "node" => gethostname(),
-            "start" => start_datetime,
-            "finish" => nothing,
-            "duration_seconds" => round(time() - start, digits=2),
-            "memory_gb" => memory_rss_gb(),
-            "memory_peak_gb" => memory_peak_gb()
-        )
-
-        merge!(event, extra)
-        put!(WORKER_PROGRESS_CHANNEL, event)
-    end
 
     report_oracle("RUNNING")
 
@@ -690,19 +634,35 @@ end
 
     violation = true
 
-   report_oracle("BUILDING")
+     log_dir = joinpath(
+        pwd(), "results", "oracle_logs",
+        String(formulation), "gurobi_logs"
+    )
+    mkpath(log_dir)
 
-    build_start = time()
+    log_file = joinpath(
+        log_dir,
+        "oracle_iter$(iter)_n$(n).log"
+    )
 
-    m_oracle, obj = create_oracle_problem(Data)
+  report_oracle("BUILDING")
+
+ build_start = time()
+    m_oracle, obj = create_oracle_problem(
+        Data, data.u, data.v, data.w
+    )
 
     set_optimizer(
         m_oracle,
         optimizer_with_attributes(
             () -> Gurobi.Optimizer(GUROBI_ENV),
-            "OutputFlag" => 0,
+            "OutputFlag" => 1,
+            "LogToConsole" => 0,
+            "LogFile" => log_file,
             "MIPGap" => 1e-3,
-            "Threads" => 1
+            "Threads" => 1,
+            "Seed" => 1,
+            "NonConvex" => 2
         )
     )
 
@@ -720,8 +680,9 @@ end
     modify_start = time()
 
     modify_oracle_linearized(
-        Data, m_oracle, obj, y, Ξ_y, n,
-        u, v, w, λ, PredictionStar
+        Data, m_oracle, obj,
+        data.y, data.Ξ_y, n,
+        data.λ, data.PredictionStar
     )
 
     time_modify = time() - modify_start
